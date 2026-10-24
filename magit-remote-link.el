@@ -1,4 +1,4 @@
-;;; magit-remote-link.el --- Actions with remote git hub links -*- lexical-binding: t; -*-
+;;; magit-remote-link.el --- Links to files on git hosting services -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2023 Pavel Kulyov <kulyov.pavel@gmail.com>
 
@@ -30,12 +30,18 @@
 
 ;;; Commentary:
 
-;;  Actions with remote git hub links.
+;; Copy or browse the web URL of the line or region at point on the remote
+;; hosting service (GitHub, GitLab, cgit, ...).  Hosts are recognized by
+;; `magit-remote-link-hosts', and a single remote can be configured with the git
+;; config keys `remote.NAME.magit-remote-link-provider' and
+;; `remote.NAME.magit-remote-link-url'.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'project)
+(require 'format-spec)
+(require 'rx)
+(require 'url-util)
 
 (require 'magit)
 
@@ -46,135 +52,185 @@
   :prefix "magit-remote-link-"
   :group 'magit)
 
-;; TODO: display=source for lightweight markups
-;; TODO: use this mapping
 (defcustom magit-remote-link-git-hosting-providers
-  '((github "%s://%s/%s/%s/blob/%s/%s#L%s" "-L%s")
-    (gitlab "%s://gitlab.com/%s/%s/-/blob/%s/%s#L%s" "-%s")
-    (bitbucket "%s://bitbucket.org/%s/%s/src/%s/%s#lines-%s" ":%s")
-    (gitea "%s://%s/%s/%/src/branch/%s/%s#L%s" "-L%s")
-    (sourcehut "%s://git.sr.ht/~%s/%s/tree/%s/item/%s#L%s" "-:%s")
-    (notabug "%s://notabug.org/%s/%s/src/%s/%s#L%s" "-L%s")
-    (codeberg "%s://codeberg.org/%s/%s/src/branch/%s/%s#L%s" "-L%s")
-    (gitweb "%s://%s/%s/%s/tree/%s#n%s" ""))
-  "A list of git hosting providers and their URLs.
-Each item should be a list of three elements:
+  '((github    "%w/blob/%b/%f#L%l"            "%w/blob/%b/%f#L%l-L%e")
+    (gitlab    "%w/-/blob/%b/%f#L%l"          "%w/-/blob/%b/%f#L%l-%e")
+    (bitbucket "%w/src/%b/%f#lines-%l"        "%w/src/%b/%f#lines-%l:%e")
+    (gitea     "%w/src/branch/%b/%f#L%l"      "%w/src/branch/%b/%f#L%l-L%e")
+    (codeberg  "%w/src/branch/%b/%f#L%l"      "%w/src/branch/%b/%f#L%l-L%e")
+    (sourcehut "%w/tree/%b/item/%f#L%l"       "%w/tree/%b/item/%f#L%l-%e")
+    (notabug   "%w/src/%b/%f#L%l"             "%w/src/%b/%f#L%l-L%e")
+    ;; cgit has no range anchors, so a region links to its first line.
+    (cgit      "%w/tree/%f?h=%b#n%l"          "%w/tree/%f?h=%b#n%l"))
+  "A list of git hosting providers and their file URL layouts.
+Each item is a list of three elements:
   - the name of the provider (a symbol)
-  - a format string for the URL to link to a single line in a file
-  - a format string for the URL to link to a code region in a file,
-    with `%s` placeholders for the:
-  - scheme,
-  - user,
-  - repository,
-  - branch or commit hash,
-  - file path,
-  - line or region number."
-  :type '(list (list symbol string string))
+  - a template for the URL of a single line in a file
+  - a template for the URL of a region of a file
+Templates are expanded with `format-spec' using these specs:
+  - %w, the web base URL of the repository
+  - %b, the branch name or commit hash
+  - %f, the file path relative to the repository root
+  - %l, the line number (the first line of a region)
+  - %e, the last line of a region"
+  :type '(repeat (list symbol string string))
+  :group 'magit-remote-link)
+
+(defcustom magit-remote-link-hosts
+  '(("\\`github\\.com/"    github)
+    ("\\`gitlab\\.com/"    gitlab)
+    ("\\`bitbucket\\.org/" bitbucket)
+    ("\\`codeberg\\.org/"  codeberg)
+    ("\\`git\\.sr\\.ht/"   sourcehut)
+    ("\\`notabug\\.org/"   notabug)
+    ("\\`git\\.savannah\\.\\(?:non\\)?gnu\\.org/\\(?:srv/\\)?git/\\(.*\\)\\'"
+     cgit "https://cgit.git.savannah.nongnu.org/cgit/\\1.git"))
+  "Rules mapping a remote to its hosting provider and web URL.
+Each item is a list (REGEXP PROVIDER [WEB-URL]).  REGEXP is matched
+against the remote's \"HOST/PATH\", where PATH has no leading slash
+and no \".git\" suffix.  The first matching rule wins.  PROVIDER is a
+key of `magit-remote-link-git-hosting-providers'.
+
+WEB-URL is a template for the repository's web base URL, expanded with
+`format-spec' using %s (\"http\" or \"https\"), %h (host) and %p (path);
+\\1 to \\9 are replaced by the matching groups of REGEXP.  It defaults to
+\"%s://%h/%p\".
+
+A remote matching no rule is treated as a `github'-style host.  A single
+remote can be overridden with the git config keys
+`remote.NAME.magit-remote-link-provider' and
+`remote.NAME.magit-remote-link-url' (the literal web base URL)."
+  :type '(repeat (list regexp symbol (choice (const :tag "Default" nil) string)))
   :group 'magit-remote-link)
 
 
-(defconst mrl--url-regex
-  (rx
-   bol
-   (group (or "git+ssh" "git" "http" "https")) (or ?@ "://")  ; scheme
-   (group (+ any)) (or ?: ?/)  ; hub hostname
-   (group (+ any)) ?/  ; user name
-   (group (+? any)) (0+ ".git")   ; project name
-   eol)
-  "Regex for parsing remote URL.")
+(defconst mrl--scheme-url-regex
+  (rx bol (+ (any alnum ?+ ?-)) "://"
+      (? (+ (not (any ?@ ?/))) ?@)        ; user
+      (group (+ (not (any ?: ?/))))       ; host
+      (? ?: (+ digit))                    ; port
+      ?/
+      (group (*? anychar)) (? ".git") (? ?/) eol)
+  "Regex for remote URLs like ssh://user@host/path.git.")
 
-
-(defclass mrl-data ()
-  ((scheme :initarg :scheme)
-   (base-url :initarg :base-url)
-   (user :initarg :user)
-   (project :initarg :project)
-   (branch :initarg :branch)
-   (filename :initarg :filename)
-   (lineno :initarg :lineno)
-   (endno :initarg :endno))
-  :documentation "Structure for creation a full remote URL to a line or a region in a file.")
+(defconst mrl--scp-url-regex
+  (rx bol
+      (? (+ (not (any ?@ ?/))) ?@)        ; user
+      (group (+ (not (any ?: ?/))))       ; host
+      ?: (? ?/)
+      (group (*? anychar)) (? ".git") (? ?/) eol)
+  "Regex for scp-style remote URLs like user@host:path.git.")
 
-(cl-defmethod mrl-extend-with-file-context ((data mrl-data))
-  "Extend DATA with information about opened file at point (actually buffer)."
-
-  ;; For read-only files opened in a some revision, for example via magit-blame or other diff
-  ;; buffer-local variable `magit-buffer-file-name' is not nil and we should take it, because
-  ;; more generic `buffer-file-name' will be constructed as temporary string like
-  ;; "<filename>.<extension>.~<commit hash>~"
-  (setf (slot-value data :filename)
-        (or magit-buffer-file-name (file-relative-name buffer-file-name
-                                                       (project-root (project-current)))))
-
-  (if (region-active-p)
-        (progn (setf (slot-value data :lineno) (line-number-at-pos (region-beginning)))
-               (setf (slot-value data :endno) (line-number-at-pos (region-end))))
-      (setf (slot-value data :lineno) (line-number-at-pos))
-      (setf (slot-value data :endno) nil))
-
-  (setf (slot-value data :branch) (magit-get-current-branch)))
-
-(cl-defmethod mrl-format-url ((data mrl-data))
-  "Build full URL for git repository provider from DATA object."
-  (with-slots (scheme base-url user project branch filename lineno endno) data
-    (let ((url (format "%s://%s/%s/%s/blob/%s/%s#L%s"
-                       (mrl-get-http-url-scheme scheme)
-                       base-url
-                       user
-                       project
-                       branch
-                       filename
-                       lineno)))
-      (when endno (setf url (format "%s-L%s" url endno)))
-      url)))
-
-
-(defun mrl-get-http-url-scheme (scheme)
-  "Return HTTP or HTTPS based on DATA's original SCHEME, HTTPS is preferred."
-  (cond ((or (string= scheme "http") (string= scheme "https"))
-         scheme)
-        (t "https")))
-
-(defun mrl--get-current-remote-url ()
-  "Return current remote URL."
-  ;; TODO: find out how to get current remote properly (see (magit-get-current-remote))
-  (magit-get "remote" (substring-no-properties (magit-read-remote "Remote repository" "origin")) "url"))
-
-(defun mrl--parse-remote-url% (url)
-  "Parse remote URL and return data as a list."
-  (save-match-data
-    (when (string-match mrl--url-regex url)
-      (list (match-string 1 url)
-            (match-string 2 url)
-            (match-string 3 url)
-            (match-string 4 url)))))
 
 (defun mrl--parse-remote-url (url)
-  "Parse remote URL and fill our data object with extracted data."
+  "Parse the git remote URL into a plist of :scheme, :host and :path, or nil.
+Both URL schemes (https://, ssh://, git+ssh://, ...) and scp-style
+`user@host:path' remotes are understood.  The path has no leading
+slash and no \".git\" suffix."
   (save-match-data
-    (when (string-match mrl--url-regex url)
-      (cl-destructuring-bind (scheme base-url user project) (magit-remote-link--parse-remote-url% url)
-        (make-instance 'mrl-data
-                       :scheme scheme
-                       :base-url base-url
-                       :user user
-                       :project project)))))
+    (cond ((string-match mrl--scheme-url-regex url)
+           (list :scheme (if (string-prefix-p "http://" url) "http" "https")
+                 :host (match-string 1 url)
+                 :path (match-string 2 url)))
+          ((string-match mrl--scp-url-regex url)
+           (list :scheme "https"
+                 :host (match-string 1 url)
+                 :path (match-string 2 url))))))
 
-(defun mrl--get-current-remote-url-data ()
-  "Get remote URL data for the current remote."
-  (mrl--parse-remote-url (mrl--get-current-remote-url)))
+(defun mrl--expand-web-url (template specs string)
+  "Expand TEMPLATE using `format-spec' SPECS and the last match on STRING.
+Occurrences of \\N in TEMPLATE are replaced by group N of that match.
+`format-spec' can't do this itself because it reads %N as a field width."
+  (let ((groups (cl-loop for i from 1 to 9 collect (match-string i string))))
+    (replace-regexp-in-string
+     (rx ?\\ (group (any "1-9")))
+     (lambda (m) (or (nth (1- (string-to-number (match-string 1 m))) groups) ""))
+     (format-spec template specs)
+     t t)))
 
-(defun mrl--get-current-remote-data-at-point ()
-  "Get filled context data about thing at point ready to construct remote URL."
-  (let ((data (mrl--get-current-remote-url-data)))
-    (mrl-extend-with-file-context data)
-    data))
+(defun mrl--resolve-host (info)
+  "Return (PROVIDER . WEB-URL) for the parsed remote INFO.
+The result is looked up in `magit-remote-link-hosts', falling back to
+a `github'-style layout under the remote's own host."
+  (let* ((scheme (plist-get info :scheme))
+         (host (plist-get info :host))
+         (path (plist-get info :path))
+         (key (concat host "/" path))
+         (specs (list (cons ?s scheme) (cons ?h host) (cons ?p path))))
+    (save-match-data
+      (cl-loop for (regexp provider web-url) in magit-remote-link-hosts
+               when (string-match regexp key)
+               return (cons provider
+                            (mrl--expand-web-url (or web-url "%s://%h/%p") specs key))
+               finally return (cons 'github (format-spec "%s://%h/%p" specs))))))
+
+(defun mrl--encode-path (path)
+  "Percent-encode PATH for use in a URL, keeping its slashes."
+  (mapconcat #'url-hexify-string (split-string path "/") "/"))
+
+(defun mrl-format-url (remote-url branch file line end &optional provider web-url)
+  "Build the web URL of FILE at LINE (to END if non-nil) in REMOTE-URL.
+BRANCH is a branch name or commit hash and FILE is relative to the
+repository root.  PROVIDER (a symbol) and WEB-URL override what
+`magit-remote-link-hosts' would infer from REMOTE-URL.  Signal a
+`user-error' if REMOTE-URL cannot be parsed or PROVIDER is unknown."
+  (let* ((info (or (mrl--parse-remote-url remote-url)
+                   (user-error "Cannot parse remote URL: %s" remote-url)))
+         (resolved (mrl--resolve-host info))
+         (provider (or provider (car resolved)))
+         (entry (or (assq provider magit-remote-link-git-hosting-providers)
+                    (user-error "Unknown git hosting provider: %s" provider)))
+         (template (if end (nth 2 entry) (nth 1 entry))))
+    (format-spec template
+                 `((?w . ,(string-remove-suffix "/" (or web-url (cdr resolved))))
+                   (?b . ,(mrl--encode-path branch))
+                   (?f . ,(mrl--encode-path file))
+                   (?l . ,(number-to-string line))
+                   (?e . ,(and end (number-to-string end)))))))
+
+(defun mrl--current-lines ()
+  "Return (START . END) line numbers for the active region or the current line.
+END is nil unless the region spans several lines.  A region ending at the
+start of a line doesn't include that line, which is what a line-wise
+selection looks like."
+  (if (not (region-active-p))
+      (cons (line-number-at-pos nil t) nil)
+    (let* ((beg (region-beginning))
+           (end (if (and (> (region-end) beg)
+                         (save-excursion (goto-char (region-end)) (bolp)))
+                    (1- (region-end))
+                  (region-end)))
+           (start-line (line-number-at-pos beg t))
+           (end-line (line-number-at-pos end t)))
+      (cons start-line (and (> end-line start-line) end-line)))))
+
+(defun mrl--current-url ()
+  "Prompt for a remote and return the web URL for the line or region at point."
+  (let* ((remote (substring-no-properties (magit-read-remote "Remote repository" "origin")))
+         (config (lambda (key)
+                   (magit-get "remote" remote (concat "magit-remote-link-" key))))
+         (provider (funcall config "provider"))
+         (branch (or (magit-get-current-branch) (magit-rev-parse "HEAD")))
+         (lines (mrl--current-lines))
+         ;; Unlike `buffer-file-name', which for a blob at some revision is a
+         ;; temporary name like "<file>.~<hash>~", this is always relative to
+         ;; the repository root.
+         (file (or (magit-file-relative-name)
+                   (user-error "Buffer is not visiting a file in a Git repository"))))
+    (mrl-format-url (or (magit-get "remote" remote "url")
+                        (user-error "Remote %s has no URL" remote))
+                    branch
+                    file
+                    (car lines)
+                    (cdr lines)
+                    (and provider (intern provider))
+                    (funcall config "url"))))
 
 ;;;###autoload
 (defun magit-remote-link-copy-at-point ()
   "Copy remote URL with a line at the point or an active region to the clipboard."
   (interactive)
-  (let ((remote-url (mrl-format-url (mrl--get-current-remote-data-at-point))))
+  (let ((remote-url (mrl--current-url)))
     (kill-new remote-url)
     (message "Copied: %s" remote-url)))
 
@@ -182,7 +238,7 @@ Each item should be a list of three elements:
 (defun magit-remote-link-browse-at-point ()
   "Open remote URL in browser to a line at the point or an active region."
   (interactive)
-  (let ((remote-url (mrl-format-url (mrl--get-current-remote-data-at-point))))
+  (let ((remote-url (mrl--current-url)))
     (browse-url remote-url)
     (message "Opening: %s" remote-url)))
 
